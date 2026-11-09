@@ -103,16 +103,31 @@ class OwnRunnerTests(unittest.TestCase):
                 self.assertNotRegex(block, r":\s*write", where)
                 self.assertNotRegex(head, r":\s*write", where)
 
-    def test_checks_split_between_both_pools(self):
+    def test_checks_have_safe_runner_selection_or_fork_hosted_parallel_gate(self):
         ci = (WORKFLOWS / "ci.yml").read_text()
-        verify = dict(jobs(ci))["verify"]
-        value = runs_on(verify)
-        # A pull request by the last digit of its number unless SELF_HOSTED_CI=all; main's pushes keep GitHub's cache.
+        blocks = dict(jobs(ci))
+        value = runs_on(blocks["verify"])
+        if value == "ubuntu-latest":
+            # Fork CI runs on GitHub's hosted runners, not the upstream's
+            # inaccessible self-hosted pools. Preserve the verify status gate.
+            for name in ("preflight", "rust-lint", "rust-tests", "verify", "launcher", "parity-scope"):
+                self.assertEqual("ubuntu-latest", runs_on(blocks[name]), name)
+            self.assertIn("needs: [preflight, rust-lint, rust-tests]", blocks["verify"])
+            self.assertIn("always()", blocks["verify"])
+            self.assertIn("needs.preflight.result", blocks["verify"])
+            self.assertIn("needs.rust-lint.result", blocks["verify"])
+            self.assertIn("needs.rust-tests.result", blocks["verify"])
+            # A fork must not attempt parity without the upstream's
+            # private/vanilla game runners and installed data.
+            self.assertIn("github.repository == 'horizon-rust/horizon'", blocks["parity"])
+            return
+
+        # Upstream CI distributes jobs across its own runners and GitHub's.
         self.assertIn("github.event_name == 'pull_request' && (", value)
         self.assertIn("vars.SELF_HOSTED_CI == 'all'", value)
         self.assertIn("endsWith(format('{0}', github.event.pull_request.number), '0')", value)
         self.assertNotIn(FORK_GUARD, value)
-        self.assertEqual(value, runs_on(dict(jobs(ci))["launcher"]))
+        self.assertEqual(value, runs_on(blocks["launcher"]))
 
     def test_the_light_runners_refuse_forks_themselves(self):
         script = (ROOT / "tools/ci/checks-runners.sh").read_text()
