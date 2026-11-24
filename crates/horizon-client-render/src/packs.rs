@@ -176,16 +176,6 @@ fn codec_int(v: &serde_json::Value) -> Option<i64> {
             .map(|f| f.trunc() as i64)
     })
 }
-fn format_of(v: &serde_json::Value) -> Option<(i64, i64)> {
-    match v {
-        serde_json::Value::Number(n) => Some((n.as_i64()?, 0)),
-        serde_json::Value::Array(a) => Some((
-            a.first()?.as_i64()?,
-            a.get(1).and_then(|m| m.as_i64()).unwrap_or(0),
-        )),
-        _ => None,
-    }
-}
 /// `PackFormat`: major and minor.
 type Format = (i64, i64);
 /// `PackFormat.lastPreMinorVersion`: the last major without minor versions,
@@ -212,10 +202,13 @@ fn format_codec(v: &serde_json::Value, default_minor: i64) -> Option<Format> {
         v => Some((non_negative(v)?, default_minor)),
     }
 }
-/// `InclusiveRange.codec(Codec.INT)`: `[min, max]` or
+/// `InclusiveRange.codec(Codec.INT)`: an int, `[min, max]` or
 /// `{min_inclusive, max_inclusive}`, min not above max.
 fn int_range_codec(v: &serde_json::Value) -> Option<(i64, i64)> {
     let int = |v: &serde_json::Value| codec_int(v).filter(|n| i32::try_from(*n).is_ok());
+    if let Some(n) = int(v) {
+        return Some((n, n));
+    }
     let (min, max) = match v {
         serde_json::Value::Array(a) if a.len() == 2 => (int(&a[0])?, int(&a[1])?),
         serde_json::Value::Object(o) => {
@@ -405,37 +398,30 @@ pub fn compatibility_for(meta: &serde_json::Value, current: Format) -> crate::pa
         Ok(_) => Compat::Compatible,
     }
 }
-/// Whether an `overlays.entries[]` item applies to the current format
-/// (OverlayMetadataSection: `formats` as an int, `[min, max]` or
-/// `{min_inclusive, max_inclusive}`, or `min_format`/`max_format`).
+/// `OverlayMetadataSection.OverlayEntry.isApplicable`: whether an
+/// `overlays.entries[]` item applies to the current format (`formats` via
+/// `InclusiveRange.codec(Codec.INT)`, or `min_format`/`max_format` via
+/// `PackFormat.BOTTOM_CODEC`/`TOP_CODEC`).
 fn overlay_applies(entry: &serde_json::Value) -> bool {
     let current = RESOURCE_FORMAT;
-    if let (Some(min), Some(max)) = (
-        format_of(&entry["min_format"]),
-        format_of(&entry["max_format"]),
-    ) {
-        return min <= current && current <= (max.0, if max.1 == 0 { i64::MAX } else { max.1 });
+    let Ok(min) = optional(&entry["min_format"], |v| format_codec(v, 0)) else {
+        return false;
+    };
+    let Ok(max) = optional(&entry["max_format"], |v| {
+        format_codec(v, i64::from(i32::MAX))
+    }) else {
+        return false;
+    };
+    let Ok(formats) = optional(&entry["formats"], int_range_codec) else {
+        return false;
+    };
+    if min.is_some() != max.is_some() {
+        return false;
     }
-    let formats = &entry["formats"];
-    if let Some(n) = formats.as_i64() {
-        return n == current.0;
+    if let (Some(min), Some(max)) = (min, max) {
+        return min <= max && min <= current && current <= max;
     }
-    if let Some(a) = formats.as_array() {
-        return match (
-            a.first().and_then(|v| v.as_i64()),
-            a.get(1).and_then(|v| v.as_i64()),
-        ) {
-            (Some(lo), Some(hi)) => lo <= current.0 && current.0 <= hi,
-            _ => false,
-        };
-    }
-    match (
-        formats["min_inclusive"].as_i64(),
-        formats["max_inclusive"].as_i64(),
-    ) {
-        (Some(lo), Some(hi)) => lo <= current.0 && current.0 <= hi,
-        _ => false,
-    }
+    formats.is_some_and(|(lo, hi)| lo <= current.0 && current.0 <= hi)
 }
 fn overlays_of(meta: &serde_json::Value, configs: &horizon_polytone::pack::Configs) -> Vec<String> {
     meta["overlays"]["entries"]
@@ -2978,8 +2964,19 @@ mod tests {
             {"formats":[90,96],"directory":"old"},
             {"formats":{"min_inclusive":97,"max_inclusive":97},"directory":"new"},
             {"min_format":97,"max_format":[97,5],"directory":"also"},
+            {"min_format":[97,0],"max_format":[97,0],"directory":"prior_minor"},
+            {"min_format":[97],"max_format":[97],"directory":"whole_major"},
+            {"min_format":[97.1],"max_format":97.1,"directory":"decimal_new"},
+            {"formats":[96.5,97.9],"directory":"decimal_old"},
+            {"min_format":97,"formats":97,"directory":"missing_max"},
+            {"min_format":[97,2],"max_format":[97,1],"directory":"inverted"},
+            {"min_format":[97,"bad"],"max_format":97,"directory":"bad_minor"},
+            {"formats":[97,98,99],"directory":"three"},
             {"formats":50,"directory":"no"}]}}"#);
-        assert_eq!(overlays_of(&meta, &Default::default()), ["new", "also"]);
+        assert_eq!(
+            overlays_of(&meta, &Default::default()),
+            ["new", "also", "whole_major", "decimal_new", "decimal_old"]
+        );
         // Only one plain folder of the pack, as vanilla's DIR_VALIDATOR has it.
         let meta = v(r#"{"overlays":{"entries":[
             {"formats":97,"directory":".."},
