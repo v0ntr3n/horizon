@@ -4818,54 +4818,54 @@ impl Renderer {
         // meshes put all their opaque quads first, so each pass draws its part
         // in a run or two. Other Metal devices (Intel, AMD) draw one pass.
         crate::mesher::group_parts(tiled_solid_gpu(&adapter.get_info()));
-        // Readable as storage where flat draws run: a shader pack's terrain program reads them.
-        let arena = arena::Arena::new(
-            &device,
-            std::mem::size_of::<TerrainVertex>() as u64,
-            1 << 20,
-            flat_wanted,
-        );
+        let terrain_stride = std::mem::size_of::<TerrainVertex>() as u64;
         // Sections as one index list per frame where multi-draw is emulated.
-        let mut flat = flat_wanted.then(|| {
-            let buffers = [Some(wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<TerrainVertex>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &TERRAIN_ATTRIBUTES,
-            })];
-            let info = adapter.get_info();
-            // Metal's per-section path drops cutout leaves (the canopy above trunks vanishes),
-            // and cave culling can drop the listed count below MIN_SECTIONS on a normal view:
-            // so Metal draws vanilla terrain flat at any count.
-            let min_sections = if flat::is_broken_intel_vulkan(&info)
-                || flat::is_adreno_dx12(&info)
-                || info.backend == wgpu::Backend::Metal
-                || std::env::var("HORIZON_FLAT_DRAWS").as_deref() == Ok("1")
-            {
-                0
-            } else if flat::for_vanilla(&info) {
-                flat::MIN_SECTIONS
-            } else {
-                // Only a shader pack's terrain and shadow pass draw flat here.
-                usize::MAX
-            };
-            flat::Flat::new(
-                &device,
-                &bindings,
-                arena.page_vertices(),
-                min_sections,
-                indirect_execution,
-                |layout, label, vertex, fragment, blend, cull, pulled| {
-                    let buffers: &[Option<wgpu::VertexBufferLayout<'_>>] =
-                        if pulled { &[] } else { &buffers };
-                    pipeline_in(
-                        layout, label, vertex, fragment, buffers, tri, cull, true, true, blend,
-                    )
-                },
-                |layout, label, vertex, fragment, cull| {
-                    solid_in(layout, label, vertex, fragment, &[], cull)
-                },
-            )
-        });
+        let mut flat = flat_wanted
+            .then(|| {
+                let page_vertices =
+                    arena::Arena::new(&device, terrain_stride, 1 << 20, true).page_vertices();
+                let buffers = [Some(wgpu::VertexBufferLayout {
+                    array_stride: terrain_stride,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &TERRAIN_ATTRIBUTES,
+                })];
+                let info = adapter.get_info();
+                // Metal's per-section path drops cutout leaves (the canopy above trunks vanishes),
+                // and cave culling can drop the listed count below MIN_SECTIONS on a normal view:
+                // so Metal draws vanilla terrain flat at any count.
+                let min_sections = if flat::is_broken_intel_vulkan(&info)
+                    || flat::is_adreno_dx12(&info)
+                    || info.backend == wgpu::Backend::Metal
+                    || std::env::var("HORIZON_FLAT_DRAWS").as_deref() == Ok("1")
+                {
+                    0
+                } else if flat::for_vanilla(&info) {
+                    flat::MIN_SECTIONS
+                } else {
+                    // Only a shader pack's terrain and shadow pass draw flat here.
+                    usize::MAX
+                };
+                flat::Flat::new(
+                    &device,
+                    &bindings,
+                    page_vertices,
+                    min_sections,
+                    indirect_execution,
+                    |layout, label, vertex, fragment, blend, cull, pulled| {
+                        let buffers: &[Option<wgpu::VertexBufferLayout<'_>>] =
+                            if pulled { &[] } else { &buffers };
+                        pipeline_in(
+                            layout, label, vertex, fragment, buffers, tri, cull, true, true, blend,
+                        )
+                    },
+                    |layout, label, vertex, fragment, cull| {
+                        solid_in(layout, label, vertex, fragment, &[], cull)
+                    },
+                )
+            })
+            .flatten();
+        // Readable as storage where flat draws run: a shader pack's terrain program reads them.
+        let arena = arena::Arena::new(&device, terrain_stride, 1 << 20, flat.is_some());
         // With flat draws' page groups the per-section solid draws read their vertices from
         // the page too (`Flat::page_group`), in either layout of the solid quads
         // (`mesher::packed`): only the origins stay a vertex buffer, at slot 1.

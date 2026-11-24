@@ -1415,7 +1415,7 @@ mod tests {
                 msaa: None,
             }
         };
-        let mut flat = flat::Flat::new(
+        let Some(mut flat) = flat::Flat::new(
             &device,
             &terrain_layout,
             4 * GRAIN,
@@ -1423,7 +1423,10 @@ mod tests {
             false,
             pipeline,
             solid,
-        );
+        ) else {
+            eprintln!("no flat draws: skipped");
+            return;
+        };
         let stride = std::mem::size_of::<crate::mesher::TerrainVertex>() as u64;
         let mut translucent = Arena::translucent(&device, stride, 4 * GRAIN);
         translucent.page_limit = 4 * GRAIN;

@@ -4213,7 +4213,7 @@ mod tests {
         };
 
         let page_vertices = 4 * GRAIN;
-        let mut flat = Flat::new(
+        let Some(mut flat) = Flat::new(
             &device,
             &terrain_layout,
             page_vertices,
@@ -4221,7 +4221,10 @@ mod tests {
             false,
             dummy_pipeline_ref,
             dummy_solid,
-        );
+        ) else {
+            eprintln!("no flat draws: skipped");
+            return;
+        };
         let mut arena = Arena::new(
             &device,
             std::mem::size_of::<TerrainVertex>() as u64,

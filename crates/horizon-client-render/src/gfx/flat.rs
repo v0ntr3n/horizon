@@ -449,11 +449,81 @@ fn plan(
     }
 }
 
+type ComputePipelines = (
+    wgpu::ComputePipeline,
+    wgpu::BindGroupLayout,
+    wgpu::ComputePipeline,
+    wgpu::BindGroupLayout,
+);
+
+/// `flatten.wgsl`'s pipelines and their group 0 layouts, unless the device
+/// fails to make them: an OpenGL driver can list compute and storage
+/// extensions while wgpu writes the GLSL version of its core version, which has
+/// neither (Mesa's `MESA_GL_VERSION_OVERRIDE`, older core profiles).
+fn compute_pipelines(device: &wgpu::Device) -> Option<ComputePipelines> {
+    compute_pipelines_from(device, include_str!("flatten.wgsl"))
+}
+
+fn compute_pipelines_from(device: &wgpu::Device, source: &str) -> Option<ComputePipelines> {
+    let compute = wgpu::ShaderStages::COMPUTE;
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Flatten section draws"),
+        entries: &[
+            storage(0, compute, true),
+            storage(1, compute, true),
+            storage(2, compute, false),
+        ],
+    });
+    let seen_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Flatten phase 2 section draws"),
+        entries: &[
+            storage(0, compute, true),
+            storage(2, compute, false),
+            storage(3, compute, true),
+            storage(4, compute, false),
+        ],
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Flatten section draws"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let compute_pipeline = |layout: &wgpu::BindGroupLayout, entry| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Flatten section draws"),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Flatten section draws"),
+                    bind_group_layouts: &[Some(layout)],
+                    ..Default::default()
+                }),
+            ),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    let flatten = compute_pipeline(&compute_layout, "flatten");
+    let flatten_seen = compute_pipeline(&seen_layout, "flatten_seen");
+    let internal = pollster::block_on(internal.pop());
+    let validation = pollster::block_on(validation.pop());
+    match internal.or(validation) {
+        None => Some((flatten, compute_layout, flatten_seen, seen_layout)),
+        Some(e) => {
+            log::warn!("Horizon renderer: section draws kept per section ({e})");
+            None
+        }
+    }
+}
+
 impl Flat {
     /// `pipeline(layout, label, vertex entry, fragment entry, blend, cull, pulled)` builds a
     /// terrain pipeline as the per-section ones, without the origin buffer, and without
     /// vertex buffers when `pulled` (its vertex shader reads the page, `ARENA_BINDING`);
     /// `solid(layout, label, vertex entry, fragment entry)` a pulled solid one.
+    /// `None` when the device fails to compile the index-flattening compute pipelines.
     pub fn new(
         device: &wgpu::Device,
         terrain_layout: &wgpu::BindGroupLayout,
@@ -470,7 +540,8 @@ impl Flat {
             bool,
         ) -> wgpu::RenderPipeline,
         solid: impl Fn(&wgpu::PipelineLayout, &str, &str, &str, wgpu::Face) -> SolidPipeline,
-    ) -> Self {
+    ) -> Option<Self> {
+        let (flatten, compute_layout, flatten_seen, seen_layout) = compute_pipelines(device)?;
         let vertex = wgpu::ShaderStages::VERTEX;
         let compute = wgpu::ShaderStages::COMPUTE;
         let (vtm, vm) = if super::surface_setup::mesh_shader::on(device) {
@@ -494,48 +565,9 @@ impl Flat {
             bind_group_layouts: &[Some(terrain_layout), Some(&draw_layout)],
             ..Default::default()
         });
-        let compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Flatten section draws"),
-            entries: &[
-                storage(0, compute, true),
-                storage(1, compute, true),
-                storage(2, compute, false),
-            ],
-        });
-        let seen_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Flatten phase 2 section draws"),
-            entries: &[
-                storage(0, compute, true),
-                storage(2, compute, false),
-                storage(3, compute, true),
-                storage(4, compute, false),
-            ],
-        });
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Flatten section draws"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("flatten.wgsl").into()),
-        });
-        let compute_pipeline = |layout: &wgpu::BindGroupLayout, entry| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Flatten section draws"),
-                layout: Some(
-                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("Flatten section draws"),
-                        bind_group_layouts: &[Some(layout)],
-                        ..Default::default()
-                    }),
-                ),
-                module: &module,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        };
-        let flatten = compute_pipeline(&compute_layout, "flatten");
-        let flatten_seen = compute_pipeline(&seen_layout, "flatten_seen");
         let storage_usage = wgpu::BufferUsages::STORAGE;
         let back = Some(wgpu::Face::Back);
-        Self {
+        Some(Self {
             looks: Vec::new(),
             // The solid draws read either layout of the solid quads (`mesher::packed`) from
             // the page; translucent ones keep their vertex buffer.
@@ -648,7 +680,7 @@ impl Flat {
             range_align: (u64::from(device.limits().min_storage_buffer_offset_alignment) / 16)
                 .max(1),
             page_instances: false,
-        }
+        })
     }
     /// A section uploaded to `vertices` vertices from `start` of the page keyed `page`:
     /// its id, which its blocks now name (written through `uploads` in `encoder`).
@@ -1873,5 +1905,75 @@ mod tests {
         let before = all.len();
         all.dedup();
         assert_eq!(all.len(), before);
+    }
+
+    #[test]
+    fn compute_pipeline_failure_is_caught_and_declines_flat_draws() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some((adapter, device, _queue)) = crate::gfx::test_gpu::optional_device() else {
+            return;
+        };
+        let outer = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        assert!(
+            compute_pipelines_from(&device, "@compute @workgroup_size(1) fn missing_entry() {}")
+                .is_none()
+        );
+        if supported(&adapter, &device) {
+            let terrain_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &[],
+                });
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Wgsl(
+                    "@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4(0.0); }                      @fragment fn fs() -> @location(0) vec4<f32> { return vec4(0.0); }"
+                        .into(),
+                ),
+            });
+            let pipeline =
+                |layout: &wgpu::PipelineLayout, label: &str, _: &str, _: &str, _, _, _| {
+                    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some(label),
+                        layout: Some(layout),
+                        vertex: wgpu::VertexState {
+                            module: &module,
+                            entry_point: Some("vs"),
+                            compilation_options: Default::default(),
+                            buffers: &[],
+                        },
+                        primitive: Default::default(),
+                        depth_stencil: None,
+                        multisample: Default::default(),
+                        fragment: Some(wgpu::FragmentState {
+                            module: &module,
+                            entry_point: Some("fs"),
+                            compilation_options: Default::default(),
+                            targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
+                        }),
+                        multiview_mask: None,
+                        cache: None,
+                    })
+                };
+            let solid =
+                |layout: &wgpu::PipelineLayout, label: &str, _: &str, _: &str, _| SolidPipeline {
+                    plain: pipeline(layout, label, "", "", None, None, true),
+                    hdr: None,
+                    msaa: None,
+                };
+            let flat = Flat::new(
+                &device,
+                &terrain_layout,
+                4 * GRAIN,
+                0,
+                false,
+                &pipeline,
+                solid,
+            );
+            if adapter.get_info().backend != wgpu::Backend::Gl {
+                assert!(flat.is_some());
+            }
+        }
+        assert!(pollster::block_on(outer.pop()).is_none());
     }
 }
