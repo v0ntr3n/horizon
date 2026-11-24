@@ -14,18 +14,14 @@ jobs:
         with:
           ref: fix/opengl-flat-draws
           fetch-depth: 0
-      - name: Setup
+      - name: Setup and run OpenGL 3.3 proof
         run: |
           {
-            git remote remove upstream 2>/dev/null || true
-            git remote add upstream https://github.com/horizon-rust/horizon.git
-            git fetch upstream main
+            git fetch https://github.com/horizon-rust/horizon.git main:refs/remotes/upstream/main
             HOSTED=true bash tools/ci/install_rust.sh libasound2-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev xvfb
             sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libgl1-mesa-dri libegl1 libglx-mesa0 || true
             rustup default stable
           } > "$RUNNER_TEMP/setup.log" 2>&1
-      - name: Run OpenGL 3.3 proof
-        run: |
           HEAD_SHA=$(git rev-parse HEAD)
           BASE_SHA=$(git rev-parse upstream/main)
           git checkout --detach "$BASE_SHA"
@@ -55,19 +51,25 @@ jobs:
             echo '```text'
             tail -n 25 "$RUNNER_TEMP/unit-gl33.log"
             echo '```'
-          } > "$RUNNER_TEMP/proof.md"
+          } > "$RUNNER_TEMP/out.md"
           test "$BEFORE_EXIT" -ne 0 && test "$AFTER_EXIT" -eq 0 && test "$UNIT_EXIT" -eq 0
-      - name: Comment proof
+      - name: Post comment
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ -s "$RUNNER_TEMP/proof.md" ]; then
-            gh pr comment "${{ github.event.pull_request.number }}" --body-file "$RUNNER_TEMP/proof.md"
-          elif [ -s "$RUNNER_TEMP/setup.log" ]; then
-            { echo "### opengl-proof setup log"; echo '```text'; tail -n 50 "$RUNNER_TEMP/setup.log"; echo '```'; } > "$RUNNER_TEMP/d.md"
-            gh pr comment "${{ github.event.pull_request.number }}" --body-file "$RUNNER_TEMP/d.md"
+          BODY="$RUNNER_TEMP/comment.md"
+          if [ -s "$RUNNER_TEMP/out.md" ]; then
+            cp "$RUNNER_TEMP/out.md" "$BODY"
+          else
+            {
+              echo "### opengl-proof diagnostic"
+              echo '```text'
+              tail -n 100 "$RUNNER_TEMP/setup.log" 2>/dev/null || true
+              echo '```'
+            } > "$BODY"
           fi
+          gh pr comment "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --body-file "$BODY"
 
   pr-ready:
     runs-on: ubuntu-latest
@@ -76,34 +78,43 @@ jobs:
         with:
           ref: fix/opengl-flat-draws
           fetch-depth: 0
-      - name: Setup
+      - name: Setup and run pr_ready
         run: |
           {
-            git remote remove upstream 2>/dev/null || true
-            git remote add upstream https://github.com/horizon-rust/horizon.git
-            git fetch upstream main
+            git fetch https://github.com/horizon-rust/horizon.git main:refs/remotes/upstream/main
             HOSTED=true bash tools/ci/install_rust.sh libasound2-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev xvfb
             sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libgl1-mesa-dri libegl1 libglx-mesa0 || true
             rustup default stable
           } > "$RUNNER_TEMP/setup.log" 2>&1
-      - name: Run pr_ready
-        run: |
           set +e
-          python3 tools/ci/with_xvfb.py python3 tools/pr_ready.py --base upstream/main > "$RUNNER_TEMP/pr.md" 2> "$RUNNER_TEMP/err.log"
+          python3 tools/ci/with_xvfb.py python3 tools/pr_ready.py --base upstream/main > "$RUNNER_TEMP/out.md" 2> "$RUNNER_TEMP/err.log"
           RC=$?
           set -e
           if [ "$RC" -ne 0 ]; then
-            { echo ""; echo "### stderr"; echo '```text'; tail -n 80 "$RUNNER_TEMP/err.log"; echo '```'; } >> "$RUNNER_TEMP/pr.md"
+            {
+              echo ""
+              echo "### pr_ready stderr"
+              echo '```text'
+              tail -n 100 "$RUNNER_TEMP/err.log"
+              echo '```'
+            } >> "$RUNNER_TEMP/out.md"
             exit "$RC"
           fi
-      - name: Comment pr_ready
+      - name: Post comment
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ -s "$RUNNER_TEMP/pr.md" ]; then
-            gh pr comment "${{ github.event.pull_request.number }}" --body-file "$RUNNER_TEMP/pr.md"
-          elif [ -s "$RUNNER_TEMP/setup.log" ]; then
-            { echo "### pr-ready setup log"; echo '```text'; tail -n 50 "$RUNNER_TEMP/setup.log"; echo '```'; } > "$RUNNER_TEMP/d.md"
-            gh pr comment "${{ github.event.pull_request.number }}" --body-file "$RUNNER_TEMP/d.md"
+          BODY="$RUNNER_TEMP/comment.md"
+          if [ -s "$RUNNER_TEMP/out.md" ]; then
+            cp "$RUNNER_TEMP/out.md" "$BODY"
+          else
+            {
+              echo "### pr-ready diagnostic"
+              echo '```text'
+              tail -n 100 "$RUNNER_TEMP/setup.log" 2>/dev/null || true
+              tail -n 100 "$RUNNER_TEMP/err.log" 2>/dev/null || true
+              echo '```'
+            } > "$BODY"
           fi
+          gh pr comment "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --body-file "$BODY"
