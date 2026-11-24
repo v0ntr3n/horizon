@@ -1,0 +1,120 @@
+name: fork-verify
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  opengl-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/opengl-flat-draws
+          fetch-depth: 0
+      - name: Setup and run OpenGL 3.3 proof
+        run: |
+          {
+            git fetch https://github.com/horizon-rust/horizon.git main:refs/remotes/upstream/main
+            HOSTED=true bash tools/ci/install_rust.sh libasound2-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev xvfb
+            sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libgl1-mesa-dri libegl1 libglx-mesa0 || true
+            rustup default stable
+          } > "$RUNNER_TEMP/setup.log" 2>&1
+          HEAD_SHA=$(git rev-parse HEAD)
+          BASE_SHA=$(git rev-parse upstream/main)
+          git checkout --detach "$BASE_SHA"
+          set +e
+          python3 tools/ci/with_xvfb.py env HORIZON_GRAPHICS_API=opengl MESA_GL_VERSION_OVERRIDE=3.3 MESA_GLSL_VERSION_OVERRIDE=330 RUST_LOG=info,wgpu_hal=warn python3 tools/run_world_views.py "$RUNNER_TEMP/wv-before" > "$RUNNER_TEMP/before.log" 2>&1
+          BEFORE_EXIT=$?
+          set -e
+          git checkout --detach "$HEAD_SHA"
+          set +e
+          python3 tools/ci/with_xvfb.py env HORIZON_GRAPHICS_API=opengl MESA_GL_VERSION_OVERRIDE=3.3 MESA_GLSL_VERSION_OVERRIDE=330 RUST_LOG=info,wgpu_hal=warn python3 tools/run_world_views.py "$RUNNER_TEMP/wv-after" > "$RUNNER_TEMP/after.log" 2>&1
+          AFTER_EXIT=$?
+          python3 tools/ci/with_xvfb.py env WGPU_BACKEND=gl MESA_GL_VERSION_OVERRIDE=3.3 MESA_GLSL_VERSION_OVERRIDE=330 RUST_LOG=warn cargo test --locked -p horizon-client-render --features horizon-mod-package/index --lib flat::tests::compute_pipeline_failure_is_caught_and_declines_flat_draws -- --nocapture > "$RUNNER_TEMP/unit-gl33.log" 2>&1
+          UNIT_EXIT=$?
+          set -e
+          {
+            echo "### OpenGL 3.3 Proof (\`HEAD\`=\`$HEAD_SHA\`, \`base\`=\`$BASE_SHA\`)"
+            echo "- \`before\` exit: \`$BEFORE_EXIT\`"
+            echo '```text'
+            tail -n 35 "$RUNNER_TEMP/before.log"
+            echo '```'
+            echo "- \`after\` exit: \`$AFTER_EXIT\`"
+            echo '```text'
+            cat "$RUNNER_TEMP/after.log"
+            ls -lh "$RUNNER_TEMP/wv-after" || true
+            echo '```'
+            echo "- \`unit-gl33\` exit: \`$UNIT_EXIT\`"
+            echo '```text'
+            tail -n 25 "$RUNNER_TEMP/unit-gl33.log"
+            echo '```'
+          } > "$RUNNER_TEMP/out.md"
+          test "$BEFORE_EXIT" -ne 0 && test "$AFTER_EXIT" -eq 0 && test "$UNIT_EXIT" -eq 0
+      - name: Post comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY="$RUNNER_TEMP/comment.md"
+          if [ -s "$RUNNER_TEMP/out.md" ]; then
+            cp "$RUNNER_TEMP/out.md" "$BODY"
+          else
+            {
+              echo "### opengl-proof diagnostic"
+              echo '```text'
+              tail -n 100 "$RUNNER_TEMP/setup.log" 2>/dev/null || true
+              echo '```'
+            } > "$BODY"
+          fi
+          gh pr comment "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --body-file "$BODY"
+
+  pr-ready:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/opengl-flat-draws
+          fetch-depth: 0
+      - name: Setup and run pr_ready
+        run: |
+          {
+            git fetch https://github.com/horizon-rust/horizon.git main:refs/remotes/upstream/main
+            HOSTED=true bash tools/ci/install_rust.sh libasound2-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev xvfb
+            sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libgl1-mesa-dri libegl1 libglx-mesa0 || true
+            rustup default stable
+          } > "$RUNNER_TEMP/setup.log" 2>&1
+          set +e
+          python3 tools/ci/with_xvfb.py python3 tools/pr_ready.py --base upstream/main > "$RUNNER_TEMP/out.md" 2> "$RUNNER_TEMP/err.log"
+          RC=$?
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            {
+              echo ""
+              echo "### pr_ready stderr"
+              echo '```text'
+              tail -n 100 "$RUNNER_TEMP/err.log"
+              echo '```'
+            } >> "$RUNNER_TEMP/out.md"
+            exit "$RC"
+          fi
+      - name: Post comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY="$RUNNER_TEMP/comment.md"
+          if [ -s "$RUNNER_TEMP/out.md" ]; then
+            cp "$RUNNER_TEMP/out.md" "$BODY"
+          else
+            {
+              echo "### pr-ready diagnostic"
+              echo '```text'
+              tail -n 100 "$RUNNER_TEMP/setup.log" 2>/dev/null || true
+              tail -n 100 "$RUNNER_TEMP/err.log" 2>/dev/null || true
+              echo '```'
+            } > "$BODY"
+          fi
+          gh pr comment "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --body-file "$BODY"
